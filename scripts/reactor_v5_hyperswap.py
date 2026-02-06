@@ -56,6 +56,7 @@ except ImportError:
 
 try:
     from insightface.utils import face_align
+    from insightface.utils.face_align import norm_crop
     INSIGHTFACE_AVAILABLE = True
 except ImportError:
     INSIGHTFACE_AVAILABLE = False
@@ -192,9 +193,10 @@ class HyperSwapFaceSwapper:
         """
         Preprocess target face for HyperSwap model.
         
-        HyperSwap uses normalization to [-1, 1] range:
-        - Convert BGR to RGB
-        - Normalize: (x / 255 - 0.5) / 0.5
+        Uses cv2.dnn.blobFromImage for consistent preprocessing:
+        - Scale: 1/127.5
+        - Mean: (127.5, 127.5, 127.5)
+        - Result: (pixel - 127.5) / 127.5 = range [-1, 1]
         
         Args:
             face_crop: Aligned face crop (BGR, uint8)
@@ -202,19 +204,21 @@ class HyperSwapFaceSwapper:
         Returns:
             Preprocessed tensor (1, 3, H, W) float32
         """
-        # BGR to RGB and normalize to [0, 1]
-        face = face_crop[:, :, ::-1].astype(np.float32) / 255.0
+        # Use cv2.dnn.blobFromImage - same as working V2 implementation
+        # This normalizes to [-1, 1] range: (pixel - 127.5) / 127.5
+        blob = cv2.dnn.blobFromImage(
+            face_crop,
+            1.0 / 127.5,  # Scale factor
+            (self.resolution, self.resolution),  # Size
+            (127.5, 127.5, 127.5),  # Mean subtraction
+            swapRB=True  # Convert BGR to RGB
+        )
         
-        # Normalize to [-1, 1] using mean=0.5, std=0.5
-        face = (face - self.MEAN) / self.STD
+        # CPU Float Normalization Fix - ensure float32 for ONNX
+        if blob.dtype != np.float32:
+            blob = blob.astype(np.float32)
         
-        # HWC to CHW format
-        face = face.transpose(2, 0, 1)
-        
-        # Add batch dimension
-        face = np.expand_dims(face, axis=0)
-        
-        return face.astype(np.float32)
+        return blob
     
     def _prepare_source_embedding(self, source_face) -> np.ndarray:
         """
@@ -253,9 +257,11 @@ class HyperSwapFaceSwapper:
         Denormalize model output.
         
         HyperSwap output is in [-1, 1] range:
-        - Denormalize: x * 0.5 + 0.5
+        - Denormalize: (x + 1) * 127.5
         - Convert to uint8
         - RGB to BGR
+        
+        Uses same approach as working V2 implementation.
         
         Args:
             output: Model output (1, 3, H, W) or (3, H, W)
@@ -265,19 +271,22 @@ class HyperSwapFaceSwapper:
         """
         # Remove batch dimension if present
         if len(output.shape) == 4:
-            face = output[0]
+            pred = output[0]  # Shape: (3, H, W)
         else:
-            face = output
+            pred = output
+        
+        # Denormalize from [-1, 1] to [0, 255] - same as V2
+        pred = np.clip(pred, -1, 1)
+        pred = (pred + 1) * 127.5
+        pred = pred.astype(np.uint8)
         
         # CHW to HWC
-        face = face.transpose(1, 2, 0)
+        pred = pred.transpose(1, 2, 0)
         
-        # Denormalize from [-1, 1] to [0, 1]
-        face = face * self.STD + self.MEAN
+        # RGB to BGR
+        pred = pred[:, :, ::-1]
         
-        # Clip and scale to [0, 255]
-        face = np.clip(face, 0, 1)
-        face = (face * 255).astype(np.uint8)
+        return pred
         
         # RGB to BGR
         face = face[:, :, ::-1]
@@ -330,44 +339,32 @@ class HyperSwapFaceSwapper:
             print("[HyperSwap] Model not loaded")
             return img
         
+        if not INSIGHTFACE_AVAILABLE:
+            print("[HyperSwap] InsightFace not available - cannot perform swap")
+            return img
+        
         try:
-            # Get landmarks
-            if hasattr(target_face, 'kps'):
-                landmarks = target_face.kps
-                if debug:
-                    print(f"[HyperSwap] Using kps landmarks, shape: {landmarks.shape}")
-            elif hasattr(target_face, 'landmark_2d_106'):
-                # Extract 5 key points from 106 landmarks
-                lm106 = target_face.landmark_2d_106
-                landmarks = np.array([
-                    lm106[38],  # Left eye
-                    lm106[88],  # Right eye
-                    lm106[86],  # Nose
-                    lm106[52],  # Left mouth
-                    lm106[61],  # Right mouth
-                ])
-                if debug:
-                    print(f"[HyperSwap] Extracted 5 landmarks from 106")
-            else:
-                print("[HyperSwap] No landmarks found on target face")
+            # Get landmarks - must have kps attribute
+            if not hasattr(target_face, 'kps'):
+                print("[HyperSwap] No 'kps' landmarks found on target face")
                 return img
             
             if debug:
-                print(f"[HyperSwap] Landmarks: {landmarks}")
+                print(f"[HyperSwap] Using kps landmarks, shape: {target_face.kps.shape}")
             
-            # Align target face using RANSAC
-            aligned_target, affine_matrix = self._align_face_ransac(img, landmarks)
-            
-            if debug:
-                print(f"[HyperSwap] Aligned face shape: {aligned_target.shape}")
-                print(f"[HyperSwap] Aligned face range: {aligned_target.min()} to {aligned_target.max()}")
-            
-            # Preprocess target face for model
-            target_input = self._preprocess_target(aligned_target)
+            # Align target face using InsightFace's norm_crop - same as V2
+            aimg = norm_crop(img, target_face.kps, image_size=self.resolution)
             
             if debug:
-                print(f"[HyperSwap] Target input shape: {target_input.shape}")
-                print(f"[HyperSwap] Target input range: {target_input.min():.3f} to {target_input.max():.3f}")
+                print(f"[HyperSwap] Aligned face shape: {aimg.shape}")
+                print(f"[HyperSwap] Aligned face range: {aimg.min()} to {aimg.max()}")
+            
+            # Preprocess target face for model using cv2.dnn.blobFromImage - same as V2
+            blob = self._preprocess_target(aimg)
+            
+            if debug:
+                print(f"[HyperSwap] Target blob shape: {blob.shape}")
+                print(f"[HyperSwap] Target blob range: {blob.min():.3f} to {blob.max():.3f}")
             
             # Prepare source embedding
             source_embedding = self._prepare_source_embedding(source_face)
@@ -376,47 +373,52 @@ class HyperSwapFaceSwapper:
                 print(f"[HyperSwap] Source embedding shape: {source_embedding.shape}")
                 print(f"[HyperSwap] Source embedding L2 norm: {np.linalg.norm(source_embedding):.3f}")
             
-            # Build inputs dict
-            inputs = {}
-            if len(self.input_names) == 2:
-                # Standard HyperSwap: source embedding + target image
-                inputs[self.source_input_name] = source_embedding
-                inputs[self.target_input_name] = target_input
-            else:
-                # Try to match input names
-                for name in self.input_names:
-                    if 'source' in name.lower() or 'embed' in name.lower():
-                        inputs[name] = source_embedding
-                    else:
-                        inputs[name] = target_input
+            # Build inputs dict - HyperSwap: 'source' = embedding (1, 512), 'target' = image (1, 3, 256, 256)
+            inputs = {
+                'source': source_embedding,
+                'target': blob
+            }
             
-            # Run inference
+            # Run the model - HyperSwap outputs: ['output', 'mask']
             outputs = self.session.run(None, inputs)
             
             if debug:
                 print(f"[HyperSwap] Output shape: {outputs[0].shape}")
                 print(f"[HyperSwap] Output range: {outputs[0].min():.3f} to {outputs[0].max():.3f}")
-                if len(outputs) > 1:
-                    print(f"[HyperSwap] Mask shape: {outputs[1].shape}")
-                    print(f"[HyperSwap] Mask range: {outputs[1].min():.3f} to {outputs[1].max():.3f}")
             
-            # Postprocess output
-            swapped_face = self._postprocess_output(outputs[0])
+            # Process output - first output is the swapped face
+            pred = self._postprocess_output(outputs[0])
             
             if debug:
-                print(f"[HyperSwap] Swapped face shape: {swapped_face.shape}")
-                print(f"[HyperSwap] Swapped face range: {swapped_face.min()} to {swapped_face.max()}")
-            
-            # Get model's mask output if available
-            model_mask = None
-            if len(outputs) > 1:
-                model_mask = outputs[1]  # Shape: [1, 1, 256, 256]
+                print(f"[HyperSwap] Swapped face shape: {pred.shape}")
+                print(f"[HyperSwap] Swapped face range: {pred.min()} to {pred.max()}")
             
             if not paste_back:
-                return swapped_face
+                return pred
             
-            # Paste back to original image using model's mask
-            return self._paste_back(img, swapped_face, affine_matrix, model_mask)
+            # Calculate the affine matrix for pasting back - same as V2
+            M = face_align.estimate_norm(target_face.kps, self.resolution)
+            IM = cv2.invertAffineTransform(M)
+            
+            # Create output image
+            result = img.copy()
+            
+            # Create mask and warp the swapped face back to original position
+            img_white = np.full((self.resolution, self.resolution, 3), 255, dtype=np.uint8)
+            mask = cv2.warpAffine(img_white, IM, (result.shape[1], result.shape[0]), flags=cv2.INTER_LINEAR)
+            mask = mask.astype(np.float32) / 255.0
+            
+            pred_warped = cv2.warpAffine(pred, IM, (result.shape[1], result.shape[0]), 
+                                          flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            
+            # Apply Gaussian blur to mask for smooth blending - same as V2
+            mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=5, sigmaY=5, borderType=cv2.BORDER_DEFAULT)
+            
+            # Blend
+            result = result * (1 - mask) + pred_warped * mask
+            result = result.astype(np.uint8)
+            
+            return result
             
         except Exception as e:
             print(f"[HyperSwap] Error during face swap: {e}")
