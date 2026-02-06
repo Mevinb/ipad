@@ -22,7 +22,7 @@ if _ext_scripts_path not in sys.path:
     sys.path.insert(0, _ext_scripts_path)
 
 # Import ReActor V5 components
-from reactor_v5_swapper_fixed import get_reactor_v5_engine
+from reactor_v5_swapper_fixed import get_reactor_v5_engine, get_available_swapper_models
 from vram_management import get_vram_manager, format_vram_status
 
 
@@ -63,6 +63,38 @@ def get_available_models():
         import traceback
         traceback.print_exc()
         return ['None', 'GPEN-BFR-512.onnx']
+
+
+def get_swapper_models():
+    """Get list of available face swapper models (inswapper + HyperSwap)"""
+    try:
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        extension_dir = os.path.dirname(current_dir)
+        extensions_dir = os.path.dirname(extension_dir)
+        webui_dir = os.path.dirname(extensions_dir)
+        models_path = os.path.join(webui_dir, 'models')
+        return get_available_swapper_models(models_path)
+    except Exception as e:
+        print(f"[ReActor V5] Error getting swapper models: {e}")
+        return ['inswapper_128.onnx']
+
+
+def get_default_swapper_model():
+    """Get the recommended default swapper model (prefer HyperSwap for quality)"""
+    models = get_swapper_models()
+    # Prefer HyperSwap 1a for best general results
+    for model in models:
+        if 'hyperswap_1a' in model.lower():
+            return model
+    # Fall back to any HyperSwap
+    for model in models:
+        if 'hyperswap' in model.lower():
+            return model
+    # Fall back to inswapper
+    for model in models:
+        if 'inswapper' in model.lower():
+            return model
+    return models[0] if models else 'inswapper_128.onnx'
 
 
 def get_default_restore_model():
@@ -155,11 +187,18 @@ class ReactorV5Script(scripts.Script):
                             info="Which face to replace in generated image"
                         )
                         
+                        swapper_model = gr.Dropdown(
+                            label="Face Swap Model",
+                            choices=get_swapper_models(),
+                            value=get_default_swapper_model(),
+                            info="HyperSwap 256px = higher quality, InSwapper 128px = faster"
+                        )
+                        
                         restore_model = gr.Dropdown(
-                            label="GPEN Restoration Model",
+                            label="Face Restoration Model",
                             choices=get_available_models(),
                             value=get_default_restore_model(),  # Use GPEN-BFR-512 by default for quality
-                            info="512 = fast (required to fix blur), 1024 = ultra-quality"
+                            info="GPEN-512 = fast, GPEN-1024 = ultra-quality"
                         )
                 
                 with gr.Row():
@@ -285,10 +324,15 @@ class ReactorV5Script(scripts.Script):
             ### 📋 ReActor V5 Processing Pipeline
             
             1. **Face Detection** - InsightFace with gender matching
-            2. **Face Swap** - Identity geometry via inswapper_128  
+            2. **Face Swap** - HyperSwap 256×256 (recommended) or InSwapper 128×128
             3. **Face Restoration** - GPEN-BFR-512 for detail recovery
             4. **Skin Texture** - Natural pore/texture overlay (combats plasticky look)
             5. **Blending** - Seamless integration with original image
+            
+            ### 🎭 HyperSwap Models
+            - **hyperswap_1a_256**: Best for occlusions, glasses, makeup
+            - **hyperswap_1b_256**: Best for extreme angles, side profiles
+            - **hyperswap_1c_256**: Best for likeness/identity accuracy
             
             ### 🎛️ IP-Adapter Integration (via ControlNet)
             
@@ -316,16 +360,17 @@ class ReactorV5Script(scripts.Script):
             - Face Restoration: GPEN-BFR-512
             
             ### 📁 Model Locations
-            - **GPEN Models**: `extensions/sd-webui-reactor-v5/models/facerestore_models/`
+            - **HyperSwap**: `models/hyperswap/` (256×256, higher quality)
+            - **InSwapper**: `models/insightface/` (128×128, faster)
+            - **GPEN Models**: `models/facerestore_models/`
             - **IP-Adapter**: Auto-downloaded to `models/ipadapter/`
-            - **InsightFace**: `models/insightface/`
             """)
             
             # Event handlers
             refresh_button.click(
-                fn=lambda: [gr.Dropdown.update(choices=get_available_models()), refresh_vram_status()],
+                fn=lambda: [gr.Dropdown.update(choices=get_swapper_models()), gr.Dropdown.update(choices=get_available_models()), refresh_vram_status()],
                 inputs=[],
-                outputs=[restore_model, vram_status]
+                outputs=[swapper_model, restore_model, vram_status]
             )
             
             vram_refresh_button.click(
@@ -344,7 +389,7 @@ class ReactorV5Script(scripts.Script):
         return [
             # Basic settings (backward compatible)
             enabled, source_image, source_face_index, target_face_index,
-            restore_model, gender_match, auto_resolution, aggressive_cleanup,
+            swapper_model, restore_model, gender_match, auto_resolution, aggressive_cleanup,
             # V5 identity guidance
             enable_ipadapter, ipadapter_weight, texture_preservation, 
             lighting_match, skin_texture_strength,
@@ -355,7 +400,7 @@ class ReactorV5Script(scripts.Script):
     def postprocess_image(self, p, pp, 
                          # Basic settings
                          enabled, source_image, source_face_index, target_face_index,
-                         restore_model, gender_match, auto_resolution, aggressive_cleanup,
+                         swapper_model, restore_model, gender_match, auto_resolution, aggressive_cleanup,
                          # V5 identity guidance  
                          enable_ipadapter, ipadapter_weight, texture_preservation,
                          lighting_match, skin_texture_strength,
@@ -409,6 +454,7 @@ class ReactorV5Script(scripts.Script):
                 return
             
             print(f"[ReActor V5] Processing image with V5 features...")
+            print(f"[ReActor V5] Swapper model: {swapper_model}")
             print(f"[ReActor V5] IP-Adapter enabled: {enable_ipadapter}")
             
             # Process with ReActor V5 enhanced pipeline
@@ -417,6 +463,7 @@ class ReactorV5Script(scripts.Script):
                 target_img=target_cv2,
                 source_face_index=int(source_face_index),
                 target_face_index=int(target_face_index),
+                swapper_model=swapper_model,
                 restore_model=restore_model,
                 gender_match=gender_match,
                 v5_config=v5_config
