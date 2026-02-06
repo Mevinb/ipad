@@ -630,8 +630,18 @@ class ReactorV5:
             print(f"[ReActor V5] Swapping: Source ({source_gender}) -> Target ({target_gender})")
             
             # Face swap (identity geometry only)
-            print("[ReActor V5] Swapping face...")
-            swapped_result = self.face_swapper.get(target_img, target_face, source_face, paste_back=True)
+            print(f"[ReActor V5] Swapping face using {self.current_swapper_name}...")
+            
+            # Enable debug for HyperSwap models
+            is_hyperswap = 'hyperswap' in self.current_swapper_name.lower() if self.current_swapper_name else False
+            if is_hyperswap and hasattr(self.face_swapper, 'get'):
+                swapped_result = self.face_swapper.get(target_img, target_face, source_face, paste_back=True, debug=True)
+            else:
+                swapped_result = self.face_swapper.get(target_img, target_face, source_face, paste_back=True)
+            
+            # Debug: Check if swap actually changed the image
+            diff = np.abs(swapped_result.astype(float) - target_img.astype(float))
+            print(f"[ReActor V5] Swap difference - mean: {diff.mean():.2f}, max: {diff.max():.0f}")
             
             # V5 enhancements (with fallbacks)
             if REALISM_ENHANCER_AVAILABLE and self.v5_config.get('frequency_blending', False):

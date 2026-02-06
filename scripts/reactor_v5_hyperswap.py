@@ -312,7 +312,7 @@ class HyperSwapFaceSwapper:
         
         return mask[:, :, np.newaxis]
     
-    def get(self, img: np.ndarray, target_face, source_face, paste_back: bool = True) -> np.ndarray:
+    def get(self, img: np.ndarray, target_face, source_face, paste_back: bool = True, debug: bool = False) -> np.ndarray:
         """
         Perform face swap using HyperSwap model.
         
@@ -321,6 +321,7 @@ class HyperSwapFaceSwapper:
             target_face: Target face object with kps attribute
             source_face: Source face object with normed_embedding attribute
             paste_back: Whether to paste swapped face back to original image
+            debug: Print debug information
             
         Returns:
             Swapped image (BGR numpy array)
@@ -333,6 +334,8 @@ class HyperSwapFaceSwapper:
             # Get landmarks
             if hasattr(target_face, 'kps'):
                 landmarks = target_face.kps
+                if debug:
+                    print(f"[HyperSwap] Using kps landmarks, shape: {landmarks.shape}")
             elif hasattr(target_face, 'landmark_2d_106'):
                 # Extract 5 key points from 106 landmarks
                 lm106 = target_face.landmark_2d_106
@@ -343,18 +346,35 @@ class HyperSwapFaceSwapper:
                     lm106[52],  # Left mouth
                     lm106[61],  # Right mouth
                 ])
+                if debug:
+                    print(f"[HyperSwap] Extracted 5 landmarks from 106")
             else:
                 print("[HyperSwap] No landmarks found on target face")
                 return img
             
+            if debug:
+                print(f"[HyperSwap] Landmarks: {landmarks}")
+            
             # Align target face using RANSAC
             aligned_target, affine_matrix = self._align_face_ransac(img, landmarks)
+            
+            if debug:
+                print(f"[HyperSwap] Aligned face shape: {aligned_target.shape}")
+                print(f"[HyperSwap] Aligned face range: {aligned_target.min()} to {aligned_target.max()}")
             
             # Preprocess target face for model
             target_input = self._preprocess_target(aligned_target)
             
+            if debug:
+                print(f"[HyperSwap] Target input shape: {target_input.shape}")
+                print(f"[HyperSwap] Target input range: {target_input.min():.3f} to {target_input.max():.3f}")
+            
             # Prepare source embedding
             source_embedding = self._prepare_source_embedding(source_face)
+            
+            if debug:
+                print(f"[HyperSwap] Source embedding shape: {source_embedding.shape}")
+                print(f"[HyperSwap] Source embedding L2 norm: {np.linalg.norm(source_embedding):.3f}")
             
             # Build inputs dict
             inputs = {}
@@ -373,14 +393,30 @@ class HyperSwapFaceSwapper:
             # Run inference
             outputs = self.session.run(None, inputs)
             
+            if debug:
+                print(f"[HyperSwap] Output shape: {outputs[0].shape}")
+                print(f"[HyperSwap] Output range: {outputs[0].min():.3f} to {outputs[0].max():.3f}")
+                if len(outputs) > 1:
+                    print(f"[HyperSwap] Mask shape: {outputs[1].shape}")
+                    print(f"[HyperSwap] Mask range: {outputs[1].min():.3f} to {outputs[1].max():.3f}")
+            
             # Postprocess output
             swapped_face = self._postprocess_output(outputs[0])
+            
+            if debug:
+                print(f"[HyperSwap] Swapped face shape: {swapped_face.shape}")
+                print(f"[HyperSwap] Swapped face range: {swapped_face.min()} to {swapped_face.max()}")
+            
+            # Get model's mask output if available
+            model_mask = None
+            if len(outputs) > 1:
+                model_mask = outputs[1]  # Shape: [1, 1, 256, 256]
             
             if not paste_back:
                 return swapped_face
             
-            # Paste back to original image
-            return self._paste_back(img, swapped_face, affine_matrix)
+            # Paste back to original image using model's mask
+            return self._paste_back(img, swapped_face, affine_matrix, model_mask)
             
         except Exception as e:
             print(f"[HyperSwap] Error during face swap: {e}")
@@ -389,14 +425,17 @@ class HyperSwapFaceSwapper:
             return img
     
     def _paste_back(self, target_image: np.ndarray, swapped_face: np.ndarray, 
-                    affine_matrix: np.ndarray) -> np.ndarray:
+                    affine_matrix: np.ndarray, model_mask: np.ndarray = None) -> np.ndarray:
         """
         Paste swapped face back to original image with seamless blending.
+        
+        Uses the model's mask output if available for better blending.
         
         Args:
             target_image: Original image
             swapped_face: Swapped face crop
             affine_matrix: Affine matrix used for alignment
+            model_mask: Optional mask from model output [1, 1, H, W]
             
         Returns:
             Result image with face pasted back
@@ -413,8 +452,16 @@ class HyperSwapFaceSwapper:
             flags=cv2.INTER_LINEAR
         )
         
-        # Create and warp mask
-        face_mask = np.ones((self.resolution, self.resolution), dtype=np.float32)
+        # Use model's mask if available, otherwise create one
+        if model_mask is not None:
+            # Process model mask: [1, 1, H, W] -> [H, W]
+            face_mask = model_mask[0, 0]  # Remove batch and channel dims
+            face_mask = np.clip(face_mask, 0, 1).astype(np.float32)
+        else:
+            # Fallback: create simple mask
+            face_mask = np.ones((self.resolution, self.resolution), dtype=np.float32)
+        
+        # Warp mask to original position
         warped_mask = cv2.warpAffine(
             face_mask, inverse_matrix, (w, h),
             borderValue=0,
