@@ -117,6 +117,31 @@ except ImportError as e:
     print(f"[ReActor V5] GPEN restorer not available: {e}")
     GPEN_RESTORER_AVAILABLE = False
 
+# Import separate swapper modules
+try:
+    from reactor_v5_inswapper import InSwapperFaceSwapper, get_inswapper, get_available_inswapper_models, clear_inswapper_cache
+    INSWAPPER_MODULE_AVAILABLE = True
+except ImportError as e:
+    print(f"[ReActor V5] InSwapper module not available: {e}")
+    INSWAPPER_MODULE_AVAILABLE = False
+
+try:
+    from reactor_v5_hyperswap import HyperSwapFaceSwapper, get_hyperswap, get_available_hyperswap_models, clear_hyperswap_cache
+    HYPERSWAP_MODULE_AVAILABLE = True
+except ImportError as e:
+    print(f"[ReActor V5] HyperSwap module not available: {e}")
+    HYPERSWAP_MODULE_AVAILABLE = False
+
+
+# ArcFace 128 template - normalized landmark positions for face alignment
+ARCFACE_128_TEMPLATE = np.array([
+    [0.36167656, 0.40387734],  # Left eye
+    [0.63696719, 0.40235469],  # Right eye
+    [0.50019687, 0.56044219],  # Nose tip
+    [0.38710391, 0.72160547],  # Left mouth corner
+    [0.61507734, 0.72034453]   # Right mouth corner
+], dtype=np.float32)
+
 
 def norm_crop(img, kps, image_size=256):
     """
@@ -128,6 +153,48 @@ def norm_crop(img, kps, image_size=256):
         warped = cv2.warpAffine(img, M, (image_size, image_size), borderValue=0.0)
         return warped
     return None
+
+
+def warp_face_by_landmarks(img, landmarks_5, template, crop_size):
+    """
+    Align face using 5-point landmarks with RANSAC estimation.
+    Better suited for HyperSwap models.
+    
+    Args:
+        img: Input image (BGR)
+        landmarks_5: 5 facial landmarks (2D array)
+        template: Normalized template landmarks
+        crop_size: Output size tuple (width, height)
+        
+    Returns:
+        Aligned face image and affine matrix
+    """
+    # Scale template to target size
+    template_scaled = template * np.array(crop_size)
+    
+    # Estimate affine transform with RANSAC
+    affine_matrix, _ = cv2.estimateAffinePartial2D(
+        landmarks_5.astype(np.float32), 
+        template_scaled,
+        method=cv2.RANSAC, 
+        ransacReprojThreshold=100
+    )
+    
+    if affine_matrix is None:
+        # Fallback to basic estimation
+        affine_matrix = cv2.getAffineTransform(
+            landmarks_5[:3].astype(np.float32),
+            template_scaled[:3]
+        )
+    
+    # Warp face
+    aligned = cv2.warpAffine(
+        img, affine_matrix, crop_size,
+        borderMode=cv2.BORDER_REPLICATE,
+        flags=cv2.INTER_AREA
+    )
+    
+    return aligned, affine_matrix
 
 
 def detect_model_resolution(model_path: str) -> int:
@@ -159,148 +226,45 @@ def detect_model_resolution(model_path: str) -> int:
         return 256
 
 
-class HyperSwapFaceSwapper:
-    """
-    HyperSwap face swapper using direct ONNX Runtime.
-    Supports 256x256 resolution for higher quality face swaps.
-    """
-    
-    def __init__(self, model_path: str, providers=None):
-        self.model_path = model_path
-        self.resolution = detect_model_resolution(model_path)
-        self.session = None
-        
-        if providers is None:
-            providers = [
-                ('CUDAExecutionProvider', {
-                    'device_id': 0,
-                    'cudnn_conv_algo_search': 'EXHAUSTIVE',
-                    'do_copy_in_default_stream': True,
-                }),
-                'CPUExecutionProvider'
-            ]
-        
-        if not ONNXRUNTIME_AVAILABLE:
-            raise ImportError("ONNX Runtime not available")
-        
-        # Load the model
-        sess_options = onnxruntime.SessionOptions()
-        sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-        
-        self.session = onnxruntime.InferenceSession(model_path, sess_options, providers=providers)
-        
-        # Get input/output info
-        self.input_names = [inp.name for inp in self.session.get_inputs()]
-        self.output_names = [out.name for out in self.session.get_outputs()]
-        
-        print(f"[ReActor V5] HyperSwap model loaded: {os.path.basename(model_path)}")
-        print(f"[ReActor V5] Resolution: {self.resolution}x{self.resolution}")
-        print(f"[ReActor V5] Inputs: {self.input_names}, Outputs: {self.output_names}")
-    
-    def get(self, img, target_face, source_face, paste_back=True):
-        """
-        Perform face swap using HyperSwap model.
-        
-        Args:
-            img: Target image (BGR numpy array)
-            target_face: Target face object with kps attribute
-            source_face: Source face object with normed_embedding attribute
-            paste_back: Whether to paste swapped face back to original image
-            
-        Returns:
-            Swapped image (BGR numpy array)
-        """
-        # Align and crop target face
-        aimg = norm_crop(img, target_face.kps, image_size=self.resolution)
-        if aimg is None:
-            return img
-        
-        # Prepare image blob
-        blob = cv2.dnn.blobFromImage(
-            aimg,
-            1.0 / 127.5,
-            (self.resolution, self.resolution),
-            (127.5, 127.5, 127.5),
-            swapRB=True
-        ).astype(np.float32)
-        
-        # Get source embedding
-        if hasattr(source_face, 'normed_embedding'):
-            source_embedding = source_face.normed_embedding
-        elif hasattr(source_face, 'embedding'):
-            source_embedding = source_face.embedding
-        else:
-            source_embedding = source_face
-        
-        # Ensure proper shape and type
-        if len(source_embedding.shape) == 1:
-            source_embedding = np.expand_dims(source_embedding, axis=0)
-        source_embedding = source_embedding.astype(np.float32)
-        
-        # Run inference
-        inputs = {
-            'source': source_embedding,
-            'target': blob
-        }
-        
-        outputs = self.session.run(None, inputs)
-        
-        # Process output
-        pred = outputs[0][0]  # Shape: (3, H, W)
-        pred = np.clip(pred, -1, 1)
-        pred = (pred + 1) * 127.5
-        pred = pred.astype(np.uint8)
-        pred = pred.transpose(1, 2, 0)  # (H, W, C)
-        pred = pred[:, :, ::-1]  # RGB to BGR
-        
-        if paste_back:
-            # Calculate inverse affine matrix
-            M = face_align.estimate_norm(target_face.kps, self.resolution)
-            IM = cv2.invertAffineTransform(M)
-            
-            result = img.copy()
-            
-            # Create mask for blending
-            img_white = np.full((self.resolution, self.resolution, 3), 255, dtype=np.uint8)
-            mask = cv2.warpAffine(img_white, IM, (result.shape[1], result.shape[0]), flags=cv2.INTER_LINEAR)
-            mask = mask.astype(np.float32) / 255.0
-            
-            # Warp swapped face back
-            warped_pred = cv2.warpAffine(pred, IM, (result.shape[1], result.shape[0]), flags=cv2.INTER_LINEAR)
-            
-            # Blend
-            result = (result * (1 - mask) + warped_pred * mask).astype(np.uint8)
-            return result
-        
-        return pred
+# HyperSwapFaceSwapper class is now in reactor_v5_hyperswap.py
+# InSwapperFaceSwapper class is now in reactor_v5_inswapper.py
 
 
 def get_available_swapper_models(models_path: str) -> List[str]:
     """
     Get list of available face swapper models (inswapper + HyperSwap).
+    Uses the separate module functions if available.
     """
     models = []
     
-    # Check hyperswap directory
-    hyperswap_path = os.path.join(models_path, 'hyperswap')
-    if os.path.exists(hyperswap_path):
-        for f in os.listdir(hyperswap_path):
-            if f.endswith('.onnx'):
-                models.append(f)
+    # Get HyperSwap models
+    if HYPERSWAP_MODULE_AVAILABLE:
+        models.extend(get_available_hyperswap_models(models_path))
+    else:
+        # Fallback: check hyperswap directory directly
+        hyperswap_path = os.path.join(models_path, 'hyperswap')
+        if os.path.exists(hyperswap_path):
+            for f in os.listdir(hyperswap_path):
+                if f.endswith('.onnx') and 'hyperswap' in f.lower():
+                    models.append(f)
     
-    # Check insightface directory
-    insightface_path = os.path.join(models_path, 'insightface')
-    if os.path.exists(insightface_path):
-        for f in os.listdir(insightface_path):
-            if f.endswith('.onnx') and 'inswapper' in f.lower():
-                models.append(f)
-        # Also check models subdirectory
-        models_subdir = os.path.join(insightface_path, 'models')
-        if os.path.exists(models_subdir):
-            for f in os.listdir(models_subdir):
+    # Get InSwapper models
+    if INSWAPPER_MODULE_AVAILABLE:
+        models.extend(get_available_inswapper_models(models_path))
+    else:
+        # Fallback: check insightface directory directly
+        insightface_path = os.path.join(models_path, 'insightface')
+        if os.path.exists(insightface_path):
+            for f in os.listdir(insightface_path):
                 if f.endswith('.onnx') and 'inswapper' in f.lower():
-                    if f not in models:
-                        models.append(f)
+                    models.append(f)
+            # Also check models subdirectory
+            models_subdir = os.path.join(insightface_path, 'models')
+            if os.path.exists(models_subdir):
+                for f in os.listdir(models_subdir):
+                    if f.endswith('.onnx') and 'inswapper' in f.lower():
+                        if f not in models:
+                            models.append(f)
     
     # Default fallback
     if not models:
@@ -395,7 +359,11 @@ class ReactorV5:
         """
         Initialize face swapper with support for both inswapper and HyperSwap models.
         
-        HyperSwap models (256x256) provide higher quality than inswapper_128 (128x128).
+        Uses separate modules:
+        - reactor_v5_inswapper.py for InSwapper (128x128)
+        - reactor_v5_hyperswap.py for HyperSwap (256x256)
+        
+        HyperSwap models provide higher quality but require correct preprocessing.
         """
         if not INSIGHTFACE_AVAILABLE:
             raise ImportError("InsightFace not installed")
@@ -407,50 +375,67 @@ class ReactorV5:
         # Unload current swapper if switching models
         if self.face_swapper is not None and self.current_swapper_name != model_name:
             print(f"[ReActor V5] Switching swapper from {self.current_swapper_name} to {model_name}")
-            del self.face_swapper
-            self.face_swapper = None
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            self._clear_swapper()
         
         print(f"[ReActor V5] Initializing face swapper: {model_name}")
         
-        # Search paths including hyperswap models
-        search_paths = [
-            os.path.join(self.shared_models_root, 'hyperswap', model_name),  # HyperSwap 256x256
-            os.path.join(self.insightface_path, model_name),
-            os.path.join(self.insightface_path, 'models', model_name),
-            os.path.join(self.shared_models_root, 'reactor', model_name),
-        ]
-        
-        model_path = None
-        for path in search_paths:
-            if os.path.exists(path):
-                model_path = path
-                break
-        
-        if model_path is None:
-            raise FileNotFoundError(f"Model not found: {model_name}. Searched: {search_paths}")
-        
         # Detect if this is a HyperSwap model (256x256) or inswapper (128x128)
-        is_hyperswap = 'hyperswap' in model_name.lower() or '256' in model_name
+        is_hyperswap = 'hyperswap' in model_name.lower()
         
-        if is_hyperswap and ONNXRUNTIME_AVAILABLE:
-            # Use HyperSwap loader for 256x256 models
+        if is_hyperswap:
+            # Use HyperSwap module for 256x256 models
+            if not HYPERSWAP_MODULE_AVAILABLE:
+                raise ImportError("HyperSwap module not available")
+            
+            model_path = os.path.join(self.shared_models_root, 'hyperswap', model_name)
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(f"HyperSwap model not found: {model_path}")
+            
             print(f"[ReActor V5] Using HyperSwap 256x256 model (higher quality)")
             self.face_swapper = HyperSwapFaceSwapper(model_path)
             self.current_swapper_resolution = 256
         else:
-            # Use InsightFace model_zoo for inswapper models
+            # Use InSwapper module for 128x128 models
+            # Search paths for inswapper
+            search_paths = [
+                os.path.join(self.insightface_path, model_name),
+                os.path.join(self.insightface_path, 'models', model_name),
+                os.path.join(self.shared_models_root, 'reactor', model_name),
+            ]
+            
+            model_path = None
+            for path in search_paths:
+                if os.path.exists(path):
+                    model_path = path
+                    break
+            
+            if model_path is None:
+                raise FileNotFoundError(f"InSwapper model not found: {model_name}. Searched: {search_paths}")
+            
             print(f"[ReActor V5] Using InSwapper 128x128 model")
-            self.face_swapper = model_zoo.get_model(
-                model_path,
-                providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
-            )
+            
+            # Use InSwapper module if available, otherwise fallback to model_zoo
+            if INSWAPPER_MODULE_AVAILABLE:
+                self.face_swapper = InSwapperFaceSwapper(model_path)
+            else:
+                self.face_swapper = model_zoo.get_model(
+                    model_path,
+                    providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+                )
             self.current_swapper_resolution = 128
         
         self.current_swapper_name = model_name
         print(f"[ReActor V5] Face swapper ready: {model_path} ({self.current_swapper_resolution}x{self.current_swapper_resolution})")
+    
+    def _clear_swapper(self):
+        """Clear current swapper and free memory."""
+        if self.face_swapper is not None:
+            del self.face_swapper
+            self.face_swapper = None
+        self.current_swapper_name = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     def get_faces(self, img: np.ndarray) -> List:
         """Get detected faces (backward compatible with V3)"""
